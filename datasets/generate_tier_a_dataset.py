@@ -34,8 +34,8 @@ import json
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.linalg import cholesky
-from scipy.stats import chi2
+from scipy.linalg import cholesky  # type: ignore[import-untyped]
+from scipy.stats import chi2        # type: ignore[import-untyped]
 
 
 @dataclass
@@ -182,19 +182,19 @@ def sample(geom: Geometry, n_samples, sample_seed):
     rng = np.random.default_rng(sample_seed)
     counts = rng.multinomial(n_samples, geom.class_props)
 
-    Z, y, in_rare = [], [], []
+    Z_parts, y_parts, in_rare_parts = [], [], []
     for c, n_c in enumerate(counts):
         n_rare = int(round(n_c * geom.rare_prop))
         n_core = n_c - n_rare
         core = geom.means[c] + _noise(rng, n_core, geom.d, geom.heavy_tail, geom.df)
         rare = geom.rare_centres[c] + geom.rare_scale * rng.standard_normal((n_rare, geom.d))
-        Z.append(np.vstack([core, rare]))
-        y.append(np.full(n_c, c))
-        in_rare.append(np.r_[np.zeros(n_core, bool), np.ones(n_rare, bool)])
+        Z_parts.append(np.vstack([core, rare]))
+        y_parts.append(np.full(n_c, c))
+        in_rare_parts.append(np.r_[np.zeros(n_core, bool), np.ones(n_rare, bool)])
 
-    Z = np.vstack(Z)
-    y = np.concatenate(y)
-    in_rare = np.concatenate(in_rare)
+    Z = np.vstack(Z_parts)
+    y = np.concatenate(y_parts)
+    in_rare = np.concatenate(in_rare_parts)
 
     mahalanobis = np.linalg.norm(Z - geom.means[y], axis=1)
     in_tail = mahalanobis**2 > geom.tail_threshold
@@ -249,7 +249,7 @@ def calibrate(separations=(2.0, 3.0, 4.0, 5.0, 6.0), n_estimators=200, **geom_kw
     class and that metric can never show degradation; if everything starts near
     1.0 the task is too easy for collapse to be visible.
     """
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import RandomForestClassifier  # type: ignore[import-untyped]
 
     geom_kw.pop("separation", None)  # separation is the swept variable here
     rows = []
