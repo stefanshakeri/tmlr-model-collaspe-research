@@ -154,18 +154,33 @@ def leaf_features(leaf_ids, encoding, encoder=None):
     return onehot_leaf_features(leaf_ids, encoder)
 
 
-def transform_leaf_features(X, leaf_forest, encoding, encoder=None):
-    """Apply an ALREADY-FITTED generation's forest (+ encoder, for "onehot")
-    to new data -- e.g. scoring the fixed real held-out test set against
-    this generation's model. Reuses the training encoder's categories rather
-    than fitting a new one, since a held-out set must be encoded consistently
-    with what the generation's downstream classifier was actually trained on.
+def transform_leaf_features(X_query, info, mode="replace"):
+    """Score-time counterpart to recycle_leaf_indices, for held-out data
+    (e.g. the fixed real test set) at the same generation. Same
+    (X_query, info, mode) -> X_next_query contract as
+    synthetic_features.transform_oob_predictions and
+    random_partition_features.transform_random_partition, so a loop driver
+    can score any of the three recycling schemes uniformly.
+
+    Reuses info["leaf_forest"] (+ info["encoder"] for "onehot") from
+    recycle_leaf_indices's return -- the training encoder's categories,
+    rather than a freshly fit one, since a held-out set must be encoded
+    consistently with what the generation's downstream classifier was
+    actually trained on.
     """
-    if encoding == "onehot" and encoder is None:
-        raise ValueError("encoder is required to transform held-out data under 'onehot'")
-    leaf_ids = leaf_forest.apply(X)
-    Z, _ = leaf_features(leaf_ids, encoding, encoder)
-    return Z
+    if mode not in ("replace", "accumulate"):
+        raise ValueError(f"mode must be 'replace' or 'accumulate', got {mode!r}")
+    if info["encoding"] == "onehot" and info["encoder"] is None:
+        raise ValueError("info['encoder'] is required to transform held-out data under 'onehot'")
+
+    leaf_ids = info["leaf_forest"].apply(X_query)
+    Z, _ = leaf_features(leaf_ids, info["encoding"], info["encoder"])
+
+    if mode == "replace":
+        return Z
+    if info["encoding"] == "ordinal":
+        return np.hstack([X_query, Z])
+    return sp.hstack([sp.csr_matrix(X_query), Z]).tocsr()
 
 
 def recycle_leaf_indices(X, y, config=LeafIndexConfig(), random_state=0,
@@ -245,7 +260,7 @@ if __name__ == "__main__":
             random_state=0,
         ).fit(X_next, y_next)
 
-        Z_test = transform_leaf_features(test.X, info["leaf_forest"], encoding, info["encoder"])
+        test_next = transform_leaf_features(test.X, info, mode="replace")
         print(f"{encoding:8s} X_next shape={shape}  "
               f"gen-1 train acc={gen1.score(X_next, y_next):.4f}  "
-              f"gen-1 test acc={gen1.score(Z_test, test.y):.4f}")
+              f"gen-1 test acc={gen1.score(test_next, test.y):.4f}")

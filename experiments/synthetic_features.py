@@ -187,8 +187,12 @@ def fit_synthetic_random_forest(X, y, config=SRFConfig(), random_state=0):
 def recycle_oob_predictions(X, y, config=SRFConfig(), random_state=0, mode="replace"):
     """Produce the next generation's training features by recycling
     continuous OOB predictions -- the E3 counterpart to a discrete
-    leaf-index recycling scheme, run under the same (X, y, random_state)
-    contract so the two can sit in an identical generational loop.
+    leaf-index recycling scheme. Same
+    (X, y, config, random_state, mode) -> (X_next, y, info) contract as
+    leaf_index_features.recycle_leaf_indices and
+    random_partition_features.recycle_random_partition, so a loop driver can
+    swap between all three recycling schemes without changing anything else
+    about the run.
 
     mode="replace"    : X_next = Z only (primary condition, full resampling;
                          experimental_design.md 1).
@@ -196,14 +200,39 @@ def recycle_oob_predictions(X, y, config=SRFConfig(), random_state=0, mode="repl
 
     y is returned unchanged: only features are regenerated each generation
     (experimental_design.md 1's stated scoping choice).
+
+    Returns
+    -------
+    X_next, y, info : info holds `component_forests` (the fitted RFj's --
+        needed by transform_oob_predictions to score held-out data, e.g. the
+        fixed real test set, at this same generation) and `nodesize_order`.
     """
     if mode not in ("replace", "accumulate"):
         raise ValueError(f"mode must be 'replace' or 'accumulate', got {mode!r}")
 
-    _, synthetic = component_forests(X, y, config, random_state)
+    forests, synthetic = component_forests(X, y, config, random_state)
     Z, order = stack_synthetic_features(synthetic)
     X_next = Z if mode == "replace" else np.hstack([X, Z])
-    return X_next, y, order
+    info = dict(component_forests=forests, nodesize_order=order)
+    return X_next, y, info
+
+
+def transform_oob_predictions(X_query, info, mode="replace"):
+    """Score-time counterpart to recycle_oob_predictions, for held-out data
+    (e.g. the fixed real test set) at the same generation. Reuses the SAME
+    fitted component forests recorded in info["component_forests"] --
+    scoring held-out rows uses ordinary predict_proba rather than an OOB
+    prediction, since those rows were never part of any tree's bootstrap
+    sample to begin with, so there is no leakage to guard against the way
+    there is for training data (paper Remark 2).
+    """
+    if mode not in ("replace", "accumulate"):
+        raise ValueError(f"mode must be 'replace' or 'accumulate', got {mode!r}")
+
+    synthetic = {ns: clf.predict_proba(X_query)[:, :-1]
+                 for ns, clf in info["component_forests"].items()}
+    Z, _ = stack_synthetic_features(synthetic)
+    return Z if mode == "replace" else np.hstack([X_query, Z])
 
 
 if __name__ == "__main__":
@@ -232,20 +261,17 @@ if __name__ == "__main__":
 
     # Full Algorithm 1 (paper's "SRF"): synthetic features augment the original.
     srf, srf_info = fit_synthetic_random_forest(train.X, train.y, config, random_state=0)
-    Z_test, _ = stack_synthetic_features(
-        {ns: clf.predict_proba(test.X)[:, :-1]
-         for ns, clf in srf_info["component_forests"].items()}
-    )
-    Z_tail, _ = stack_synthetic_features(
-        {ns: clf.predict_proba(tail_eval.X)[:, :-1]
-         for ns, clf in srf_info["component_forests"].items()}
-    )
-    print(f"SRF  test acc: {srf.score(np.hstack([test.X, Z_test]), test.y):.4f}  "
-          f"tail acc: {srf.score(np.hstack([tail_eval.X, Z_tail]), tail_eval.y):.4f}")
+    test_augmented = transform_oob_predictions(test.X, srf_info, mode="accumulate")
+    tail_augmented = transform_oob_predictions(tail_eval.X, srf_info, mode="accumulate")
+    print(f"SRF  test acc: {srf.score(test_augmented, test.y):.4f}  "
+          f"tail acc: {srf.score(tail_augmented, tail_eval.y):.4f}")
 
     # E3 hook: one recursive "replace" step -- next generation trains only on
-    # recycled OOB predictions from generation 0, labels held fixed.
-    X_next, y_next, order = recycle_oob_predictions(
+    # recycled OOB predictions from generation 0, labels held fixed. The
+    # fixed real test set is pushed through the SAME recycling step via
+    # transform_oob_predictions, reusing generation 0's fitted component
+    # forests -- exactly what a loop driver needs to score each generation.
+    X_next, y_next, info = recycle_oob_predictions(
         train.X, train.y, config, random_state=0, mode="replace"
     )
     gen1_rf = RandomForestClassifier(
@@ -253,7 +279,9 @@ if __name__ == "__main__":
         max_features=config.resolve_mtry(X_next.shape[1]), n_jobs=config.n_jobs,
         random_state=0,
     ).fit(X_next, y_next)
+    test_next = transform_oob_predictions(test.X, info, mode="replace")
     print(f"\nrecycle_oob_predictions(mode='replace'): "
-          f"X_next shape={X_next.shape}, nodesize_order={order}")
+          f"X_next shape={X_next.shape}, nodesize_order={info['nodesize_order']}")
     print(f"gen-1 RF (trained on recycled OOB preds) train acc: "
-          f"{gen1_rf.score(X_next, y_next):.4f}")
+          f"{gen1_rf.score(X_next, y_next):.4f}  test acc: "
+          f"{gen1_rf.score(test_next, test.y):.4f}")

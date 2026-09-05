@@ -57,7 +57,7 @@ import pandas as pd  # type: ignore[import-untyped]
 from sklearn.ensemble import RandomForestClassifier  # type: ignore[import-untyped]
 
 from ._common import child_seeds
-from .metrics import compute_generation_metrics
+from .metrics import compute_generation_metrics, masked_accuracy
 from .synthetic_features import SRFConfig, recycle_oob_predictions, transform_oob_predictions
 from .leaf_index_features import LeafIndexConfig, recycle_leaf_indices, transform_leaf_features
 from .random_partition_features import recycle_random_partition, transform_random_partition
@@ -122,6 +122,7 @@ def run_trajectory(
     true_feature_train0=None, true_feature_test0=None,
     track_fi_drift: bool = False,
     fi_method: str = "l1", mi_n_bins: int = 10, w2_max_samples: int = 1000,
+    extra_masks: Optional[dict] = None,
 ):
     """Run ONE seed's recursive generational loop: fit a fresh forest, score
     it against the fixed test set (in this generation's own feature space),
@@ -155,12 +156,25 @@ def run_trajectory(
         docstring. Off by default because it is NOT meaningful under
         mode="replace" with leaf-index/OOB recycling, where the feature
         space changes identity every generation.
+    extra_masks : optional {name: bool mask over test_y}, e.g. Income's
+        IncomeSplit.group_masks (per-race, per-sex membership). Logs one
+        extra column per mask, "acc_<name>", each generation's masked
+        accuracy against the fixed test set in that generation's own
+        feature space. This is what experimental_design.md's Income
+        callout ("the minority-group representation metrics that connect
+        directly to Wyllie et al.") actually needs -- compute_
+        generation_metrics only threads through a single in_rare proxy,
+        not a whole family of group breakdowns. Masks describe test-set ROW
+        identity, which never changes across generations even though the
+        FEATURE REPRESENTATION those rows are in does -- so the same masks
+        apply unmodified at every generation.
 
     Returns
     -------
     list[dict] : one dict per generation, each metrics.csv column key ->
         value (whatever compute_generation_metrics could compute from the
-        given inputs) plus a "generation" key. Feed to results_frame().
+        given inputs), each extra_masks key as "acc_<name>", plus a
+        "generation" key. Feed to results_frame().
     """
     rf_kwargs = dict(rf_kwargs or {"n_estimators": 500, "min_samples_leaf": 5, "n_jobs": -1})
 
@@ -188,6 +202,12 @@ def run_trajectory(
             mi_n_bins=mi_n_bins, w2_max_samples=w2_max_samples, w2_random_state=fit_seeds[g],
         )
         row["generation"] = g
+
+        if extra_masks:
+            y_pred = clf.predict(X_test)
+            for name, mask in extra_masks.items():
+                row[f"acc_{name}"] = masked_accuracy(test_y, y_pred, mask)
+
         rows.append(row)
 
         if g == 0:
