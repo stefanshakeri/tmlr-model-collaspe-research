@@ -49,6 +49,12 @@ I/O, or the on-disk cache format. That split is deliberate -- datasets/ is
 "what raw data did we get", experiments/preprocessing/ is "what does an
 experiment need done to it" -- so a change to subsampling strategy or the
 rare-class threshold never touches the fetch/cache path and vice versa.
+
+Stratified sampling and correlation-based pruning are shared with
+experiments/preprocessing/income.py's Tier B preprocessing via
+experiments/preprocessing/_shared.py, rather than duplicated here -- both
+datasets need the exact same two operations, and independent copies would
+risk silently drifting to different definitions of "rare" or "redundant".
 """
 
 from dataclasses import dataclass
@@ -58,6 +64,11 @@ import json
 import numpy as np
 
 from .._common import child_seeds
+from ._shared import (
+    stratified_indices, CorrelationPruning, correlation_matrix as _correlation_matrix,
+    highly_correlated_pairs, fit_correlation_pruning as _fit_correlation_pruning,
+    apply_pruning as _apply_pruning,
+)
 from datasets.covertype_dataset import (
     fetch_covertype_raw, N_CONTINUOUS, DEFAULT_CACHE_DIR,
 )
@@ -124,24 +135,6 @@ def make_geometry(rare_threshold=0.02, cache_dir=DEFAULT_CACHE_DIR):
     )
 
 
-def _stratified_indices(y, n, rng):
-    """Proportional-allocation stratified sample of `n` indices into `y`,
-    without replacement within each class. The real-data analog of
-    datasets/generate_tier_a_dataset.py's multinomial class allocation in
-    `sample()`, adapted to sample INDICES into existing rows rather than
-    draw new points -- preserving, not distorting, whatever rare classes
-    are present in `y`, which is the entire reason to use Covertype."""
-    labels, inverse, counts = np.unique(y, return_inverse=True, return_counts=True)
-    alloc = rng.multinomial(n, counts / counts.sum())
-    idx_parts = []
-    for lbl_i, take in enumerate(alloc):
-        pool = np.flatnonzero(inverse == lbl_i)
-        idx_parts.append(rng.choice(pool, size=min(take, len(pool)), replace=False))
-    idx = np.concatenate(idx_parts)
-    rng.shuffle(idx)
-    return idx
-
-
 def make_splits(geom, n_subsample=50_000, test_frac=0.2, sample_seed=0,
                  cache_dir=DEFAULT_CACHE_DIR):
     """Stratified ~n_subsample-row draw from the full population (proportional
@@ -159,11 +152,11 @@ def make_splits(geom, n_subsample=50_000, test_frac=0.2, sample_seed=0,
     X_full, y_full = fetch_covertype_raw(cache_dir)
     subsample_seed, split_seed = child_seeds(sample_seed, 2)
 
-    sub_idx = _stratified_indices(y_full, n_subsample, np.random.default_rng(subsample_seed))
+    sub_idx = stratified_indices(y_full, n_subsample, np.random.default_rng(subsample_seed))
     X_sub, y_sub = X_full[sub_idx], y_full[sub_idx]
 
     n_test = int(round(len(y_sub) * test_frac))
-    test_idx = _stratified_indices(y_sub, n_test, np.random.default_rng(split_seed))
+    test_idx = stratified_indices(y_sub, n_test, np.random.default_rng(split_seed))
     test_mask = np.zeros(len(y_sub), dtype=bool)
     test_mask[test_idx] = True
 
@@ -213,29 +206,6 @@ CONTINUOUS_FEATURE_NAMES = (
 )
 
 
-@dataclass
-class CorrelationPruning:
-    """A fixed, population-level decision about which continuous features
-    are redundant -- computed ONCE from the full population and reused
-    across every subsample/split seed. See module docstring: recomputing
-    this per-subsample would let the pruned feature set itself vary by
-    sample_seed, which breaks fi_drift's requirement that a generation-k and
-    a generation-0 importance vector index the same columns, and would
-    silently change which continuous columns W2 runs over from run to run.
-    """
-    threshold: float
-    keep_idx: np.ndarray  # indices into the (unpruned) continuous block, kept
-    dropped: list          # [(dropped_name, kept_partner_name, r), ...], most-correlated first
-
-    def to_dict(self):
-        return {"threshold": self.threshold, "keep_idx": self.keep_idx.tolist(),
-                "dropped": self.dropped}
-
-    def config_id(self):
-        payload = json.dumps(self.to_dict(), sort_keys=True).encode()
-        return hashlib.sha1(payload).hexdigest()[:10]
-
-
 def correlation_matrix(X, n_continuous=N_CONTINUOUS):
     """Pearson correlation matrix of the continuous features (see
     continuous_features()). Restricted to the continuous block for the same
@@ -244,54 +214,20 @@ def correlation_matrix(X, n_continuous=N_CONTINUOUS):
     exclusivity (columns of the same one-hot block are trivially
     anti-correlated by construction), not genuine feature redundancy.
     """
-    return np.corrcoef(continuous_features(X, n_continuous), rowvar=False)
-
-
-def highly_correlated_pairs(corr, threshold=0.9):
-    """(i, j, r) triples of column indices with |corr[i, j]| >= threshold,
-    i < j, most-correlated first. threshold=0.9 is the conventional
-    multicollinearity cutoff; lower it to flag more aggressively. Returns
-    raw indices, not names -- fit_correlation_pruning is what attaches
-    CONTINUOUS_FEATURE_NAMES for a human-readable log."""
-    p = corr.shape[0]
-    pairs = [
-        (i, j, float(corr[i, j]))
-        for i in range(p) for j in range(i + 1, p)
-        if abs(corr[i, j]) >= threshold
-    ]
-    pairs.sort(key=lambda t: -abs(t[2]))
-    return pairs
+    return _correlation_matrix(continuous_features(X, n_continuous))
 
 
 def fit_correlation_pruning(threshold=0.9, cache_dir=DEFAULT_CACHE_DIR,
                              feature_names=CONTINUOUS_FEATURE_NAMES):
     """Decide which continuous features to drop as redundant, from the FULL
-    population (fixed once -- see CorrelationPruning's docstring).
-
-    Greedy findCorrelation-style heuristic: for each offending pair (|r| >=
-    threshold, strongest first), drop whichever of the two features has the
-    larger mean |correlation| against every OTHER continuous feature (not
-    just its partner in this pair) -- a feature central to several redundant
-    pairs is removed before one only weakly duplicated once. A feature
-    already dropped by a stronger pair is left alone when a later, weaker
-    pair involving it is considered.
+    population (fixed once -- CorrelationPruning's docstring in
+    experiments/preprocessing/_shared.py explains why). Delegates the actual
+    greedy findCorrelation-style heuristic to _shared.fit_correlation_pruning,
+    shared with income.py; this wrapper's only job is fetching and slicing
+    Covertype's own continuous block first.
     """
     X_full, _ = fetch_covertype_raw(cache_dir)
-    corr = correlation_matrix(X_full)
-    p = corr.shape[0]
-    mean_abs_corr = (np.abs(corr).sum(axis=1) - 1) / (p - 1)  # exclude self
-
-    dropped_idx = set()
-    dropped_log = []
-    for i, j, r in highly_correlated_pairs(corr, threshold):
-        if i in dropped_idx or j in dropped_idx:
-            continue
-        drop, keep = (i, j) if mean_abs_corr[i] >= mean_abs_corr[j] else (j, i)
-        dropped_idx.add(drop)
-        dropped_log.append((feature_names[drop], feature_names[keep], r))
-
-    keep_idx = np.array([k for k in range(p) if k not in dropped_idx])
-    return CorrelationPruning(threshold=threshold, keep_idx=keep_idx, dropped=dropped_log)
+    return _fit_correlation_pruning(continuous_features(X_full), feature_names, threshold)
 
 
 def apply_pruning(X, pruning: CorrelationPruning, n_continuous=N_CONTINUOUS):
@@ -302,9 +238,7 @@ def apply_pruning(X, pruning: CorrelationPruning, n_continuous=N_CONTINUOUS):
     train, test, and any future tail-eval-equivalent -- never refit per
     split, for the reason CorrelationPruning's docstring explains.
     """
-    cont = continuous_features(X, n_continuous)[:, pruning.keep_idx]
-    onehot = X[:, n_continuous:]
-    return np.hstack([cont, onehot])
+    return _apply_pruning(X, pruning, n_continuous)
 
 
 if __name__ == "__main__":
