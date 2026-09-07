@@ -1,0 +1,4 @@
+dataset,n_train,d_total,n_continuous,n_classes,majority_pct,minority_pct,rare_group_pct
+Tier A (synthetic),10000,10,10,2,0.8759,0.1241,0.015
+Covertype (Tier B),40000,54,10,7,0.48759922342395684,0.004727957426008413,0.020775
+Income (Tier B),38097,91,5,2,0.7576489363936079,0.24235106360639214,0.017822925689686853
