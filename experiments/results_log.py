@@ -70,7 +70,8 @@ class RunConfig:
     feature_mode: str
     min_samples_leaf: int
     replace_mode: str      # "replace" or "accumulate"
-    sample_schedule: str = "fixed"   # "fixed", "linear", "superlinear" (E5)
+    sample_schedule: str = "fixed"   # only "fixed" is in scope; the growing-n
+                                     # sweep (former E5) was cut from the design
     synthetic_frac: float = 1.0       # E6's mixing fraction; 1.0 outside E6
     structure_seed: Optional[int] = None
     d: Optional[float] = None
