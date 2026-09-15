@@ -40,6 +40,7 @@ GENERATION_METRIC_COLUMNS = (
     "acc_test", "n_leaves_occupied", "recall_minority", "recall_rare",
     "acc_tail", "acc_tail_eval", "pred_prob_var", "tree_disagreement",
     "w2_feature", "leaf_entropy", "mi_x_leaf", "fi_drift",
+    "fi_concentration",
 )
 
 
@@ -329,6 +330,74 @@ def feature_importance_drift(importances_k, importances_0, method="l1"):
     raise ValueError(f"method must be 'l1' or 'spearman', got {method!r}")
 
 
+def feature_importance_concentration(importances):
+    """Width-INVARIANT companion to feature_importance_drift: how unevenly
+    this generation's predictive work is spread over whatever features it
+    currently has.
+
+    feature_importance_drift can only compare generation k to generation 0
+    when the feature space means the same thing in both -- which rules out
+    the whole leaf-index family under mode="replace", since the one-hot
+    width changes every generation. That left metric #8 ("whether the
+    model's internal structure, not just its accuracy, degenerates",
+    experimental_design.md 3) uncomputable in exactly the conditions the
+    paper's headline claim is about. This metric closes that gap: it is a
+    property of ONE importance vector, so it is comparable across
+    generations of different dimensionality.
+
+    Defined as 1 - H(w) / log(p), where w is the importance vector
+    normalised to a distribution and p its length:
+      0.0 -> importance spread perfectly evenly over all p features
+      1.0 -> all importance on a single feature
+    Rising values mean the forest is concentrating its splits on an ever
+    smaller effective set of features, i.e. structural degeneration, which
+    is the observable metric #8 was introduced to capture. Reported
+    alongside fi_drift, not instead of it: where both are defined they
+    answer different questions (drift = has the structure MOVED, versus
+    generation 0; concentration = how degenerate is the structure NOW).
+
+    Returns NaN for a degenerate single-feature space (log(1) = 0), where
+    concentration is not defined rather than trivially maximal. Also NaN when
+    total importance is zero, which happens when the forest has collapsed to
+    a constant predictor and makes no splits at all -- undefined, not
+    maximally concentrated.
+
+    INTERPRETING THIS ACROSS GENERATIONS -- read before quoting a trajectory.
+    The log(p) normalisation makes the value comparable in RANGE across
+    feature spaces of different size, but it does not make a change in the
+    value attributable to degeneration alone when p itself is moving:
+
+      - Where p is FIXED across generations, this is a clean structural
+        measurement. That is the label-recycling condition
+        (label_recycling_features.recycle_labels_only), whose feature matrix
+        is the original X forever. A rise there is genuine concentration.
+      - Where p CHANGES, the generation-0-to-1 step in particular is
+        dominated by the representation change, not by degeneration: a
+        forest on ~10 dense informative columns concentrates its importance
+        on a few of them, while the same forest on several thousand sparse
+        one-hot leaf indicators necessarily spreads importance thinly across
+        many, so the value drops sharply at generation 1 for reasons that
+        have nothing to do with collapse. Compare generation k to generation
+        1 in those conditions, never to generation 0, and say so when
+        reporting.
+
+    This is the same "is the baseline in the same space?" problem that makes
+    fi_drift undefined under replace; fi_concentration survives it only in
+    the weaker sense of remaining computable and bounded.
+    """
+    w = np.asarray(importances, dtype=float)
+    p = len(w)
+    if p < 2:
+        return float("nan")
+    total = w.sum()
+    if total <= 0:
+        return float("nan")
+    w = w / total
+    nz = w[w > 0]
+    entropy = float(-(nz * np.log(nz)).sum())
+    return float(1.0 - entropy / np.log(p))
+
+
 # ---------------------------------------------------------------------------
 # #13 gens_to_thresh / #14 p_collapse_k -- trajectory-level, computed post-hoc.
 # ---------------------------------------------------------------------------
@@ -354,12 +423,14 @@ def generations_to_threshold(metric_trajectory, frac=0.5, baseline=None):
 def probability_collapse_by_generation(trajectories, frac=0.5, baseline=None):
     """p[k] = fraction of seeds whose trajectory has crossed the
     generations_to_threshold criterion by generation k (monotone
-    nondecreasing in k). `trajectories` is (n_seeds, n_generations) -- many
-    seeds' sequences of the SAME per-generation metric. Xu et al.'s
-    probabilistic framing (experimental_design.md 3.3): most runs may
-    collapse to near-zero while a few diverge, so this -- not a mean
-    trajectory -- is what makes multi-seed reporting rigorous rather than
-    decorative.
+    nondecreasing in k, and pinned at its final value forever once a seed
+    crosses -- a CUMULATIVE first-passage CDF, i.e. the empirical CDF of
+    generations_to_threshold's hitting time across seeds). `trajectories` is
+    (n_seeds, n_generations) -- many seeds' sequences of the SAME
+    per-generation metric. This matches Suresh et al.'s generations-to-
+    threshold framing (experimental_design.md 3.2/13), NOT Xu, He & Cheng
+    (2025)'s Model Collapse probability -- see
+    marginal_probability_collapse_by_generation below for that.
 
     `baseline`, if given, is shared across all seeds (e.g. a fixed
     calibration target); if None, each seed uses its own generation-0 value.
@@ -372,6 +443,41 @@ def probability_collapse_by_generation(trajectories, frac=0.5, baseline=None):
         if g is not None:
             collapsed_at[s] = g
     return np.array([(collapsed_at <= k).mean() for k in range(n_gens)])
+
+
+def marginal_probability_collapse_by_generation(trajectories, frac=0.5, baseline=None):
+    """p[k] = fraction of seeds whose metric value AT generation k
+    (not cumulative) is below frac * baseline -- the per-generation MARGINAL
+    collapse probability, matching Xu, He & Cheng (2025)'s actual
+    operationalization of their Model Collapse definition (Section 2.2:
+    lim_{T->inf} P(||theta_T - theta*||_2 >= delta) = 1). Their experiments
+    estimate exactly this quantity independently at each generation via
+    Monte Carlo across i.i.d. replications -- Figure 3a plots
+    P(sigma_T^2 < 0.05) vs T, and Scenario 3 / Figure 9's second row plots
+    P(||theta_t - theta*||_2 >= 1) vs t -- reporting the CURRENT state of the
+    ensemble at that generation, not whether any replication has EVER
+    crossed a threshold by then.
+
+    Unlike probability_collapse_by_generation (this module), which is a
+    cumulative first-passage CDF and therefore monotone nondecreasing and
+    pinned at its peak forever after a seed first crosses, this quantity can
+    rise AND fall across generations: a seed whose metric dips below
+    frac * baseline and later recovers above it is counted as collapsed at
+    the generations it was actually below, and NOT at the generations it
+    wasn't -- exactly like the paper's own figures track the ensemble's
+    current state rather than an absorbing "has it ever collapsed" event.
+
+    `trajectories` is (n_seeds, n_generations) -- many seeds' sequences of
+    the SAME per-generation metric. `baseline`, if given, is shared across
+    all seeds; if None, each seed uses its own generation-0 value (matching
+    generations_to_threshold's default).
+    """
+    trajectories = np.asarray(trajectories, dtype=float)
+    if baseline is None:
+        baseline_col = trajectories[:, 0:1]  # each seed's own generation-0 value
+    else:
+        baseline_col = np.full((trajectories.shape[0], 1), float(baseline))
+    return (trajectories < frac * baseline_col).mean(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -448,9 +554,21 @@ def compute_generation_metrics(
                 true_feature_test, recon, w2_max_samples, w2_random_state
             )
 
-    if baseline_importances is not None:
+    importances = clf.feature_importances_
+    out["fi_concentration"] = feature_importance_concentration(importances)
+
+    # fi_drift is only defined when the feature space still means what it
+    # meant at generation 0. Under mode="replace" with leaf-index recycling
+    # the width itself changes every generation, so comparing importance
+    # vectors would be comparing unrelated columns -- feature_importance_
+    # drift raises on that rather than returning a meaningless number.
+    # Guard here instead of asking every caller to know which schemes keep a
+    # stable layout: emit the key where it is well-defined, OMIT it (not
+    # NaN) where it is not, matching this function's "absent means not
+    # applicable" contract. fi_concentration above stays defined either way.
+    if baseline_importances is not None and len(importances) == len(baseline_importances):
         out["fi_drift"] = feature_importance_drift(
-            clf.feature_importances_, baseline_importances, fi_method
+            importances, baseline_importances, fi_method
         )
 
     return out
