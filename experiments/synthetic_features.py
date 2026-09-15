@@ -44,7 +44,7 @@ Modifications made here, driven by local-docs/experimental_design.md:
 """
 
 from dataclasses import dataclass, asdict
-from typing import Union
+from typing import Union, Optional
 import hashlib
 import json
 
@@ -75,6 +75,7 @@ class SRFConfig:
     mtry: Union[int, float, str] = "paper"
     synthetic_nodesize: int = 5
     n_jobs: int = -1
+    class_weight: Optional[str] = None
 
     def resolve_mtry(self, p):
         """mtry as an int, given the original (pre-synthetic) feature count p."""
@@ -90,7 +91,7 @@ class SRFConfig:
         return hashlib.sha1(payload).hexdigest()[:10]
 
 
-def _fit_oob_forest(X, y, nodesize, mtry, ntree, n_jobs, random_state):
+def _fit_oob_forest(X, y, nodesize, mtry, ntree, n_jobs, random_state, class_weight=None):
     if nodesize >= X.shape[0]:
         raise ValueError(
             f"nodesize={nodesize} >= n={X.shape[0]}: every tree would be a "
@@ -102,6 +103,7 @@ def _fit_oob_forest(X, y, nodesize, mtry, ntree, n_jobs, random_state):
         max_features=mtry,
         bootstrap=True,
         oob_score=True,
+        class_weight=class_weight,
         n_jobs=n_jobs,
         random_state=random_state,
     ).fit(X, y)
@@ -140,7 +142,8 @@ def component_forests(X, y, config=SRFConfig(), random_state=0):
     forests, synthetic = {}, {}
     for nodesize, seed in zip(config.nodesize_grid, seeds):
         clf, oob_proba = _fit_oob_forest(
-            X, y, nodesize, mtry, config.ntree, config.n_jobs, seed
+            X, y, nodesize, mtry, config.ntree, config.n_jobs, seed,
+            config.class_weight,
         )
         forests[nodesize] = clf
         synthetic[nodesize] = oob_proba[:, :-1]  # drop last class (Remark 1)
