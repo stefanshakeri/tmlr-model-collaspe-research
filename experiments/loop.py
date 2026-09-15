@@ -20,8 +20,9 @@ anything"):
   - replace vs accumulate is a run_trajectory PARAMETER (`mode`), not baked
     into a scheme, so E4 can compare both conditions under the identical
     scheme and seed.
-  - Fixed n by default: nothing here grows n across generations (E5's
-    schedule sweep needs that and is out of scope for this module).
+  - Fixed n always: nothing here grows n across generations. The
+    growing-sample-size sweep that would need it (the former E5) was cut
+    from experimental_design.md; fixed-n is now the only schedule in scope.
   - The fixed test set, AND the tail-eval set (Tier A only), are pushed
     through the SAME per-generation transform chain as training data (via
     each scheme's `transform`), so at every generation g,
@@ -61,6 +62,10 @@ from .metrics import compute_generation_metrics, masked_accuracy
 from .synthetic_features import SRFConfig, recycle_oob_predictions, transform_oob_predictions
 from .leaf_index_features import LeafIndexConfig, recycle_leaf_indices, transform_leaf_features
 from .random_partition_features import recycle_random_partition, transform_random_partition
+from .label_recycling_features import (
+    LabelRecyclingConfig, recycle_labels_only, transform_labels_only,
+    recycle_leaf_and_labels, transform_leaf_and_labels,
+)
 
 
 @dataclass
@@ -76,6 +81,21 @@ class RecyclingScheme:
     name: str
     recycle: Callable
     transform: Callable
+    stable_layout: bool = False
+    """Whether this scheme's RECYCLED feature space keeps a fixed column
+    layout across generations, so that two generations'
+    feature_importances_ vectors index the same features and fi_drift
+    (metric #8) is well-defined. True only for the OOB scheme, whose
+    synthetic feature is a fixed stack of one block per nodesize in
+    SRFConfig.nodesize_grid -- same blocks, same order, every generation.
+    False for the leaf-index and random-partition families, whose one-hot
+    width is a function of how many leaves the CURRENT forest happens to
+    occupy and therefore changes identity generation to generation. Note
+    this describes mode="replace" only: under mode="accumulate" every
+    scheme appends to the previous generation's matrix, so the width grows
+    monotonically and no layout is stable -- run_trajectory checks the mode
+    as well as this flag.
+    """
 
 
 def oob_scheme(config: SRFConfig = SRFConfig()) -> RecyclingScheme:
@@ -85,6 +105,7 @@ def oob_scheme(config: SRFConfig = SRFConfig()) -> RecyclingScheme:
         name="oob",
         recycle=lambda X, y, seed, mode: recycle_oob_predictions(X, y, config, seed, mode),
         transform=lambda Xq, info, seed, mode: transform_oob_predictions(Xq, info, mode),
+        stable_layout=True,
     )
 
 
@@ -113,6 +134,39 @@ def random_partition_scheme(config: LeafIndexConfig = LeafIndexConfig(),
     )
 
 
+def labels_only_scheme(config: LabelRecyclingConfig = LabelRecyclingConfig()) -> RecyclingScheme:
+    """Label channel only: original features forever, labels regenerated from
+    the previous generation's OOB predictions (experimental_design.md 1.2's
+    corollary experiment). The feature space never changes, so fi_drift is
+    well-defined here from generation 1 -- but stable_layout stays False
+    because the invariance is of a different kind: nothing is recycled INTO
+    the features at all, so generation 0's importances remain a valid
+    baseline and run_trajectory's generation-1 anchor would be wrong. Handled
+    by labels_only being the one scheme where X_next is X by identity; see
+    run_trajectory's fi_drift_defined.
+    """
+    return RecyclingScheme(
+        name="labels_only",
+        recycle=lambda X, y, seed, mode: recycle_labels_only(X, y, config, seed, mode),
+        transform=lambda Xq, info, seed, mode: transform_labels_only(Xq, info, mode),
+        stable_layout=True,
+    )
+
+
+def leaf_and_labels_scheme(config: LeafIndexConfig = LeafIndexConfig(),
+                            encoding: str = "onehot") -> RecyclingScheme:
+    """Both channels open -- leaf-index features AND recycled labels. This is
+    the fully-synthetic-loop cell of Alemohammad et al.'s taxonomy, and the
+    condition experimental_design.md 1.2 names as the one that would move the
+    study out of the "synthetic loop with fixed real data" cell its other
+    experiments occupy."""
+    return RecyclingScheme(
+        name=f"leaf_and_labels_{encoding}",
+        recycle=lambda X, y, seed, mode: recycle_leaf_and_labels(X, y, config, seed, mode, encoding),
+        transform=lambda Xq, info, seed, mode: transform_leaf_and_labels(Xq, info, mode),
+    )
+
+
 def run_trajectory(
     train_X0, train_y, test_X0, test_y, scheme: RecyclingScheme,
     n_generations: int, random_state: int, mode: str = "replace",
@@ -120,7 +174,7 @@ def run_trajectory(
     in_rare=None, in_tail=None,
     tail_eval_X0=None, tail_eval_y=None,
     true_feature_train0=None, true_feature_test0=None,
-    track_fi_drift: bool = False,
+    track_fi_drift: bool = True,
     fi_method: str = "l1", mi_n_bins: int = 10, w2_max_samples: int = 1000,
     extra_masks: Optional[dict] = None,
 ):
@@ -149,13 +203,17 @@ def run_trajectory(
         full X, or a Tier B continuous_features() slice), held fixed across
         every generation regardless of what train_X/test_X currently look
         like -- see module docstring.
-    track_fi_drift : compute fi_drift against generation 0's
-        feature_importances_. Only meaningful when the feature space is
-        stable across generations (mode="accumulate", or a scheme with a
-        fixed layout) -- see experiments.metrics.feature_importance_drift's
-        docstring. Off by default because it is NOT meaningful under
-        mode="replace" with leaf-index/OOB recycling, where the feature
-        space changes identity every generation.
+    track_fi_drift : offer generation 0's feature_importances_ as the
+        fi_drift baseline. ON by default: compute_generation_metrics now
+        guards the comparison on matching width and simply omits fi_drift
+        where the feature space changed identity (leaf-index recycling under
+        mode="replace"), rather than raising or silently comparing unrelated
+        columns. So this costs nothing where fi_drift is undefined and
+        populates it everywhere it IS defined -- the OOB scheme's stacked
+        nodesize blocks keep a fixed layout across generations, which is
+        exactly where metric #8 is meaningful. fi_concentration, the
+        width-invariant companion, is always computed regardless of this
+        flag.
     extra_masks : optional {name: bool mask over test_y}, e.g. Income's
         IncomeSplit.group_masks (per-race, per-sex membership). Logs one
         extra column per mask, "acc_<name>", each generation's masked
@@ -188,6 +246,12 @@ def run_trajectory(
     rows = []
     X_train, X_test, tail_eval_X = train_X0, test_X0, tail_eval_X0
     baseline_importances = None
+    fi_drift_defined = track_fi_drift and scheme.stable_layout and mode == "replace"
+    # labels_only never touches the feature matrix, so generation 0 is
+    # already in the "recycled" space and is the correct drift baseline.
+    # Every other stable-layout scheme recycles INTO a new space at
+    # generation 1, which is where their baseline has to be taken.
+    fi_baseline_gen = 0 if scheme.name == "labels_only" else 1
 
     for g in range(n_generations + 1):
         clf = RandomForestClassifier(random_state=fit_seeds[g], **rf_kwargs).fit(X_train, train_y)
@@ -196,7 +260,7 @@ def run_trajectory(
             clf, X_train, X_test, test_y,
             tail_eval_X=tail_eval_X, tail_eval_y=tail_eval_y,
             in_rare=in_rare, in_tail=in_tail,
-            baseline_importances=(baseline_importances if track_fi_drift else None),
+            baseline_importances=baseline_importances,
             fi_method=fi_method,
             true_feature_train=true_feature_train0, true_feature_test=true_feature_test0,
             mi_n_bins=mi_n_bins, w2_max_samples=w2_max_samples, w2_random_state=fit_seeds[g],
@@ -210,7 +274,15 @@ def run_trajectory(
 
         rows.append(row)
 
-        if g == 0:
+        # fi_drift's baseline is the first generation that lives in the
+        # RECYCLED feature space -- generation 1, not generation 0.
+        # Generation 0 is fit on the original inputs, so its importance
+        # vector indexes different features (and usually a different number
+        # of them) than every later generation; anchoring drift there would
+        # make metric #8 undefined at exactly the generations it is supposed
+        # to describe. Only captured for schemes whose recycled layout is
+        # stable, under replace -- see RecyclingScheme.stable_layout.
+        if g == fi_baseline_gen and fi_drift_defined:
             baseline_importances = clf.feature_importances_
 
         if g < n_generations:
