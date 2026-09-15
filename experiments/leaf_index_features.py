@@ -43,7 +43,7 @@ encoder fit on generation g's leaf ids is never reused at generation g+1.
 """
 
 from dataclasses import dataclass, asdict
-from typing import Union
+from typing import Union, Optional
 import hashlib
 import json
 
@@ -70,11 +70,22 @@ class LeafIndexConfig:
         single leaf partition is what "leaf-index recycling" means. Also the
         knob experimental_design.md E2 sweeps to control one-hot dimension
         count (`min_samples_leaf`).
+    class_weight : passed straight to RandomForestClassifier. Needed for
+        Covertype, whose two rare classes (~0.5% and ~1.6% of the
+        population) are never predicted at all by an unweighted forest at
+        this project's leaf granularity -- recall_rare sits at exactly 0.000
+        from generation 0, which is a FLOOR, not a collapse measurement, and
+        makes the rare-class metric uninformative for that dataset.
+        "balanced" lifts it to ~0.88 and gives the metric headroom to
+        degrade. Must be set on the RECYCLING forest and not only on the
+        scoring forest: an unweighted partition drops the rare classes
+        before the scoring forest ever sees the features.
     """
     ntree: int = 500
     mtry: Union[int, float, str] = "paper"
     nodesize: int = 5
     n_jobs: int = -1
+    class_weight: Optional[str] = None
 
     def resolve_mtry(self, p):
         return resolve_mtry(self.mtry, p)
@@ -111,6 +122,7 @@ def fit_leaf_forest(X, y, config=LeafIndexConfig(), random_state=0):
         min_samples_leaf=config.nodesize,
         max_features=mtry,
         bootstrap=True,
+        class_weight=config.class_weight,
         n_jobs=config.n_jobs,
         random_state=random_state,
     ).fit(X, y)
